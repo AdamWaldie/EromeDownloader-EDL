@@ -11,7 +11,10 @@ from .config import LARGE_FILE_CHUNK_SIZE, MAX_WORKERS, THRESHOLDS
 
 
 def get_chunk_size(file_size: int) -> int:
-    """Determine the optimal chunk size based on the file size."""
+    """Determine the optimal chunk size based on the file size.
+    
+    OPTIMIZED: Now uses larger chunk sizes from config including 1MB for large files.
+    """
     for threshold, chunk_size in THRESHOLDS:
         if file_size < threshold:
             return chunk_size
@@ -25,7 +28,10 @@ def save_file_with_progress(
     task: int,
     live_manager: LiveManager,
 ) -> None:
-    """Save the content of a response to a file while tracking download progress."""
+    """Save the content of a response to a file while tracking download progress.
+    
+    OPTIMIZED: Uses improved chunk sizing for better throughput.
+    """
     file_size = int(response.headers.get("content-length", -1))
     chunk_size = get_chunk_size(file_size)
     total_downloaded = 0
@@ -55,7 +61,10 @@ def run_in_parallel(
     identifier: str,
     *args: tuple,
 ) -> None:
-    """Execute a function in parallel for a list of items, using multiple workers."""
+    """Execute a function in parallel for a list of items, using multiple workers.
+    
+    OPTIMIZED: Now uses increased MAX_WORKERS from config for better parallelization.
+    """
     num_items = len(items)
     futures = {}
 
@@ -65,5 +74,42 @@ def run_in_parallel(
         for current_task, item in enumerate(items):
             task_id = live_manager.add_task(current_task=current_task)
             future = executor.submit(func, item, task_id, live_manager, *args)
+            futures[future] = task_id
+            manage_running_tasks(futures, live_manager)
+
+
+def run_in_parallel_ordered(
+    func: callable,
+    items: list,
+    live_manager: LiveManager,
+    identifier: str,
+    *args: tuple,
+) -> None:
+    """Execute a function in parallel while maintaining sequential file numbering.
+    
+    This function passes the file number and total count to the download function
+    so files can be named sequentially (e.g., "Album (001).mp4", "Album (002).jpg")
+    
+    Args:
+        func: Function to execute (should accept file_number and total_files params)
+        items: List of items to process (download links)
+        live_manager: Live manager for progress tracking
+        identifier: Identifier for the overall task
+        *args: Additional arguments to pass (download_path, album_url, album_name)
+    """
+    num_items = len(items)
+    futures = {}
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        live_manager.add_overall_task(identifier, num_items)
+
+        for current_task, item in enumerate(items):
+            task_id = live_manager.add_task(current_task=current_task)
+            file_number = current_task + 1  # 1-indexed file numbering
+            
+            # Pass file_number and total_files to the download function
+            future = executor.submit(
+                func, item, task_id, live_manager, *args, file_number, num_items
+            )
             futures[future] = task_id
             manage_running_tasks(futures, live_manager)
