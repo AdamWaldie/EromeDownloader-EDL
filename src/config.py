@@ -1,137 +1,143 @@
-"""Profile crawler module.
+"""Configuration module for managing constants and settings used across the project.
 
-This module provides functionality to extract album links from user profile pages on
-erome. It utilizes the BeautifulSoup library for HTML parsing and requests for handling
-HTTP requests.
-
-Usage:
-    Run the script from the command line, providing the profile page URL as an
-    argument:
-        python profile_crawler.py <profile_page_url>
-
-Example:
-    python profile_crawler.py https://www.erome.com/marieanita
-
+These configurations aim to improve modularity and readability by consolidating settings
+into a single location.
 """
 
-from __future__ import annotations
+from argparse import ArgumentParser, Namespace
+from collections import deque
+from dataclasses import dataclass, field
+from enum import IntEnum
+import os
 
-import logging
-import re
-import sys
-from pathlib import Path
-from typing import TYPE_CHECKING
+# ============================
+# Paths and Files
+# ============================
+DOWNLOAD_FOLDER = "Downloads"
+URLS_FILE = "URLs.txt"
+SESSION_LOG = "session_log.txt"
+DUMP_FILE = "profile_dump.txt"
 
-from rich.console import Console
+# ============================
+# Host Configuration
+# ============================
+HOST_NETLOC = "www.erome.com"
+HOST_PAGE = f"https://{HOST_NETLOC}"
 
-from .config import DUMP_FILE, HOST_PAGE
-from .general_utils import fetch_page
-from .managers.progress_manager import create_progress_bar
+REGIONS = [
+    "cn", "cz", "de", "es", "fr", "gr", "it",
+    "nl", "jp", "pt", "pl", "rt", "ru", "se",
+]
 
-if TYPE_CHECKING:
-    from bs4 import BeautifulSoup
+# ============================
+# UI & Table Settings
+# ============================
+BUFFER_SIZE = 5
+PROGRESS_COLUMNS_SEPARATOR = "•"
 
+PROGRESS_MANAGER_COLORS = {
+    "title_color": "light_cyan3",
+    "overall_border_color": "bright_blue",
+    "task_border_color": "medium_purple",
+}
 
-def extract_page_number(page_link: dict[str, str]) -> int | None:
-    """Extract the page number from a URL."""
-    page_pattern = r"page=(\d+)"
+LOG_MANAGER_CONFIG = {
+    "colors": {
+        "title_color": "light_cyan3",
+        "border_color": "cyan",
+    },
+    "min_column_widths": {
+        "Timestamp": 10,
+        "Event": 15,
+        "Details": 30,
+    },
+    "column_styles": {
+        "Timestamp": "pale_turquoise4",
+        "Event": "pale_turquoise1",
+        "Details": "pale_turquoise4",
+    },
+}
 
-    try:
-        match = re.search(page_pattern, page_link["href"])
-        return int(match.group(1))
+# ============================
+# Download Performance
+# ============================
+CPU_CORES = os.cpu_count() or 4
 
-    except (AttributeError, ValueError, TypeError) as err:
-        message = f"Error extracting page index from {page_link['href']}: {err}"
-        logging.exception(message)
-        return None
+# OPTIMIZED: Increased max workers for better parallelization
+# I/O bound → 2× cores, but keep it reasonable for stability
+MAX_WORKERS = min(16, CPU_CORES * 2)  # Back to 16 for better stability
 
+# OPTIMIZED: Async connections
+ASYNC_CONNECTIONS = 12  # Keep at reasonable level
 
-def get_profile_page_links(
-    soup: BeautifulSoup,
-    profile: str,
-) -> list[str]:
-    """Extract and  profile page links from a BeautifulSoup object."""
-    try:
-        # Regular expression to find all 'a' tags with href that match "?page="
-        # followed by a number
-        page_links = soup.find_all(
-            "a",
-            {"href": re.compile(f"/{profile}\\?page=\\d+")},
-        )
+KB = 1024
+MB = 1024 * KB
 
-    except (AttributeError, TypeError, KeyError) as err:
-        message = f"An error occurred while processing the soup: {err}"
-        logging.exception(message)
-        return []
+THRESHOLDS = [
+    (1 * MB, 64 * KB),
+    (10 * MB, 128 * KB),
+    (100 * MB, 256 * KB),
+]
 
-    page_numbers = [extract_page_number(page_link) for page_link in page_links]
-    max_page_number = max(page_numbers) if page_numbers else None
+# OPTIMIZED: Increased chunk size for large files
+LARGE_FILE_CHUNK_SIZE = 1 * MB  # Increased from 512 * KB to 1 MB
 
-    formatted_page_links = []
-    if max_page_number is not None:
-        # The last item of the page_links list isn't useful, so it is discarded
-        formatted_page_links = [
-            HOST_PAGE + page_link.get("href") for page_link in page_links[:-1]
-        ]
+# ============================
+# Retry / Timeout
+# ============================
+MAX_RETRIES = 4
+RETRY_BACKOFF_BASE = 1.8
 
-    return formatted_page_links
+# BALANCED: Not too aggressive, not too conservative
+CONNECT_TIMEOUT = 10  # Back to original - connection should be fast
+READ_TIMEOUT = 30     # Back to original - most files download quickly
 
+# ============================
+# Async toggle
+# ============================
+USE_ASYNC_DOWNLOADER = False
 
-def extract_album_links_in_page(soup: BeautifulSoup) -> list[str]:
-    """Extract album links from a BeautifulSoup object representing a webpage."""
-    album_links_items = soup.find_all("a", {"class": "album-link", "href": True})
-    return [item.get("href") for item in album_links_items]
+# ============================
+# HTTP
+# ============================
+class HTTPStatus(IntEnum):
+    OK = 200
+    FORBIDDEN = 403
+    NOT_FOUND = 404
+    GONE = 410
+    TOO_MANY_REQUESTS = 429
+    INTERNAL_ERROR = 500
+    BAD_GATEWAY = 502
+    SERVICE_UNAVAILABLE = 503
+    SERVER_DOWN = 521
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) "
+    "Gecko/20100101 Firefox/109.0"
+)
 
-def get_profile_album_links(pages: list[str]) -> list[str]:
-    """Retrieve album links from a list of profile page links."""
-    profile_album_links = []
-    num_pages = len(pages)
+# ============================
+# File System Configuration
+# ============================
+MAX_FILENAME_LENGTH = 200  # Maximum length for filenames/folder names
 
-    with create_progress_bar() as progress_bar:
-        task = progress_bar.add_task("[cyan]Progress", total=num_pages)
-        for page in pages:
-            soup = fetch_page(page)
-            album_links = extract_album_links_in_page(soup)
-            profile_album_links.extend(album_links)
-            progress_bar.advance(task)
+# ============================
+# Data Classes
+# ============================
+@dataclass
+class ProgressConfig:
+    task_name: str
+    item_description: str
+    color: str = PROGRESS_MANAGER_COLORS["title_color"]
+    panel_width = 40
+    overall_buffer: deque = field(default_factory=lambda: deque(maxlen=BUFFER_SIZE))
 
-    return profile_album_links
-
-
-def generate_profile_dump(profile_album_links: list[str]) -> None:
-    """Generate a text file containing album links for a specified profile."""
-    with Path(DUMP_FILE).open("w", encoding="utf-8") as file:
-        file.writelines(f"{album_link}\n" for album_link in profile_album_links)
-
-
-def process_profile_url(url: str) -> None:
-    """Process a profile URL to fetch and generate a profile dump."""
-    profile = url.rstrip("/").split("/")[-1]
-    console = Console()
-    console.print(f"Dumping profile: [bold]{profile}[/bold]")
-    soup = fetch_page(url)
-
-    try:
-        page_links = get_profile_page_links(soup, profile)
-        page_links.insert(0, url)
-
-        profile_album_links = get_profile_album_links(page_links)
-        generate_profile_dump(profile_album_links)
-
-    except ValueError as val_err:
-        message = f"Error occurred processing profile URL: {val_err}"
-        logging.exception(message)
-
-    else:
-        console.print("[green]✓[/green] Dump file successfully generated.\n")
-
-
-def main() -> None:
-    """Execute the profile album extraction process."""
-    url = sys.argv[1]
-    process_profile_url(url)
-
-
-if __name__ == "__main__":
-    main()
+# ============================
+# Arguments
+# ============================
+def parse_arguments() -> Namespace:
+    parser = ArgumentParser(description="Process album downloads.")
+    parser.add_argument("-u", "--url", dest="url", type=str)
+    parser.add_argument("-p", "--profile", dest="profile", type=str)
+    parser.add_argument("--custom-path", dest="custom_path", type=str, default=None)
+    return parser.parse_args()
