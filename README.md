@@ -3,7 +3,6 @@
 > **Optimized fork** with improved naming conventions, duplicate file prevention, sequential file numbering, username detection, and performance enhancements.
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## 🎯 Overview
 
@@ -470,7 +469,7 @@ Contributions are welcome and feature requests!
 
 ## 📜 License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the GNU General Public License v3.0 - see the LICENSE file for details.
 
 ---
 
