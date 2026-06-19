@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 import os
 import random
-import sys
 import time
 
 import requests
@@ -57,9 +56,13 @@ def fetch_page(
             message = f"Error fetching page {url}: {req_err}"
             logging.exception(message)
 
-            # Exit after retries exceeded
+            # Give up on this URL after exhausting retries, but return None
+            # instead of exiting so the caller can skip this album and continue
+            # with the remaining URLs. A single blocked/rate-limited request
+            # (e.g. a 403/429 from Cloudflare) must not abort the whole batch.
             if attempt == retries - 1:
-                sys.exit(1)
+                logging.error("Giving up on %s after %d attempts.", url, retries)
+                return None
 
             # Otherwise, retry with an exponential backoff
             delay = 2 ** (attempt + 1) + random.uniform(1, 2)  # noqa: S311

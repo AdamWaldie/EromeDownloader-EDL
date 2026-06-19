@@ -403,6 +403,10 @@ def download_album(
     cookies = get_cookies_header()
     soup = fetch_page(album_url, cookies=cookies)
     if soup is None:
+        live_manager.update_log(
+            "Skipped",
+            f"Could not fetch album page (removed, private, or blocked): {album_url}",
+        )
         return
 
     album_id = album_url.rstrip("/").split("/")[-1]
