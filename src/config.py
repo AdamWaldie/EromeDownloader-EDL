@@ -117,6 +117,33 @@ USER_AGENT = (
 )
 
 # ============================
+# Rate limiting
+# ============================
+# HTTP statuses that indicate the request was rate limited or temporarily
+# blocked (Cloudflare/erome). These are retried with a back-off rather than
+# treated as a hard failure.
+RATE_LIMIT_STATUSES = (
+    int(HTTPStatus.TOO_MANY_REQUESTS),
+    int(HTTPStatus.FORBIDDEN),
+    int(HTTPStatus.SERVICE_UNAVAILABLE),
+    int(HTTPStatus.SERVER_DOWN),
+)
+# Base seconds to wait when rate limited and no Retry-After header is provided.
+RATE_LIMIT_BACKOFF = 5
+# Upper bound on a single back-off wait, so we never sleep absurdly long.
+RATE_LIMIT_MAX_BACKOFF = 120
+# Small politeness delay (seconds) between albums to avoid tripping limits.
+INTER_ALBUM_DELAY = 1.0
+
+# ============================
+# Stall / hang detection
+# ============================
+# Seconds without any download progress before a stall is reported.
+STALL_TIMEOUT = 45
+# How often (seconds) the watchdog checks active downloads for stalls.
+STALL_CHECK_INTERVAL = 5
+
+# ============================
 # File System Configuration
 # ============================
 MAX_FILENAME_LENGTH = 200  # Maximum length for filenames/folder names

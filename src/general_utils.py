@@ -15,7 +15,36 @@ import time
 import requests
 from bs4 import BeautifulSoup
 
-from .config import USER_AGENT, HTTPStatus
+from .config import (
+    RATE_LIMIT_BACKOFF,
+    RATE_LIMIT_MAX_BACKOFF,
+    RATE_LIMIT_STATUSES,
+    USER_AGENT,
+    HTTPStatus,
+)
+
+
+def is_rate_limited(status_code: int) -> bool:
+    """Return True if an HTTP status indicates rate limiting or a soft block."""
+    return status_code in RATE_LIMIT_STATUSES
+
+
+def rate_limit_delay(response: requests.Response, attempt: int) -> float:
+    """Compute how long to wait before retrying a rate-limited request.
+
+    Honors the server's ``Retry-After`` header when present (seconds form),
+    otherwise falls back to an exponential back-off, capped so a single wait is
+    never unreasonably long.
+    """
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return float(min(int(retry_after), RATE_LIMIT_MAX_BACKOFF))
+        except (TypeError, ValueError):
+            pass
+
+    backoff = RATE_LIMIT_BACKOFF * (2 ** attempt)
+    return float(min(backoff, RATE_LIMIT_MAX_BACKOFF))
 
 
 def fetch_page(
@@ -54,6 +83,26 @@ def fetch_page(
                     "Page unavailable (HTTP %s): %s", response.status_code, url,
                 )
                 return None
+
+            # Rate limited / soft-blocked: back off and retry rather than
+            # treating it as a hard failure. This is the common reason a run
+            # appears to "stop" partway through a list of albums.
+            if is_rate_limited(response.status_code):
+                last_reason = f"rate limited (HTTP {response.status_code})"
+                if attempt == retries - 1:
+                    logging.error(
+                        "Giving up on %s after %d attempts (%s).",
+                        url, retries, last_reason,
+                    )
+                    return None
+                wait = rate_limit_delay(response, attempt)
+                logging.warning(
+                    "Rate limited (HTTP %s) on %s; backing off %.0fs "
+                    "(attempt %d/%d).",
+                    response.status_code, url, wait, attempt + 1, retries,
+                )
+                time.sleep(wait)
+                continue
 
             response.raise_for_status()
             return BeautifulSoup(response.text, "html.parser")

@@ -27,22 +27,35 @@ def save_file_with_progress(
     download_path: str,
     task: int,
     live_manager: LiveManager,
-) -> None:
+    name: str | None = None,
+) -> int:
     """Save the content of a response to a file while tracking download progress.
-    
-    OPTIMIZED: Uses improved chunk sizing for better throughput.
+
+    Registers the download with the live manager's stall watchdog so a frozen
+    transfer can be identified, and returns the number of bytes written.
     """
     file_size = int(response.headers.get("content-length", -1))
     chunk_size = get_chunk_size(file_size)
     total_downloaded = 0
+    label = name if name is not None else Path(download_path).name
 
-    with Path(download_path).open("wb") as file:
-        for chunk in response.iter_content(chunk_size=chunk_size):
-            if chunk:
-                file.write(chunk)
-                total_downloaded += len(chunk)
-                progress_percentage = (total_downloaded / file_size) * 100
-                live_manager.update_task(task, completed=progress_percentage)
+    live_manager.start_download(task, label, file_size)
+    try:
+        with Path(download_path).open("wb") as file:
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    file.write(chunk)
+                    total_downloaded += len(chunk)
+                    # content-length may be missing (-1); only show a percentage
+                    # when the total size is known to avoid bogus values.
+                    if file_size > 0:
+                        progress_percentage = (total_downloaded / file_size) * 100
+                        live_manager.update_task(task, completed=progress_percentage)
+                    live_manager.record_progress(task, total_downloaded)
+    finally:
+        live_manager.finish_download(task)
+
+    return total_downloaded
 
 
 def _collect_results(

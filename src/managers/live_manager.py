@@ -8,6 +8,7 @@ refresh of the live view.
 from __future__ import annotations
 
 import datetime
+import threading
 import time
 
 from rich.console import Console, Group
@@ -15,6 +16,7 @@ from rich.live import Live
 
 from .log_manager import LoggerTable
 from .progress_manager import ProgressManager
+from .stall_watchdog import StallWatchdog
 
 
 class LiveManager:
@@ -23,6 +25,8 @@ class LiveManager:
     It allows for real-time updates and refreshes of both progress and logs in a
     terminal.
     """
+
+    # pylint: disable=too-many-instance-attributes  # display + threading state
 
     def __init__(
         self,
@@ -47,6 +51,16 @@ class LiveManager:
             refresh_per_second=refresh_per_second,
         )
         self.start_time = time.time()
+
+        # Logging and the live view are touched from multiple download threads,
+        # so serialize them to keep plain-output lines and the table coherent.
+        self._log_lock = threading.Lock()
+
+        # Stall watchdog: identifies and reports a frozen/stuck download instead
+        # of the run silently hanging.
+        self._watchdog = StallWatchdog(self.update_log)
+        self._watchdog.start()
+
         self.update_log("Script started", "The script has started execution.")
 
     def add_overall_task(self, description: str, num_tasks: int) -> None:
@@ -69,16 +83,29 @@ class LiveManager:
         self.progress_manager.update_task(task_id, completed, advance, visible=visible)
 
     def update_log(self, event: str, details: str) -> None:
-        """Log an event and refreshes the live display."""
-        self.logger_table.log(event, details)
-        if self.plain_output:
-            # No TTY: the live table is invisible, so print the event directly
-            # to give the user feedback on what the script is doing.
-            timestamp = datetime.datetime.now(datetime.timezone.utc).strftime(
-                "%H:%M:%S",
-            )
-            print(f"[{timestamp}] {event}: {details}", flush=True)
-        self.live.update(self._render_live_view())
+        """Log an event and refreshes the live display (thread-safe)."""
+        with self._log_lock:
+            self.logger_table.log(event, details)
+            if self.plain_output:
+                # No TTY: the live table is invisible, so print the event
+                # directly to give the user feedback on what the script is doing.
+                timestamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+                    "%H:%M:%S",
+                )
+                print(f"[{timestamp}] {event}: {details}", flush=True)
+            self.live.update(self._render_live_view())
+
+    def start_download(self, task_id: int, name: str, total: int) -> None:
+        """Register a download as in-flight for stall detection."""
+        self._watchdog.start_download(task_id, name, total)
+
+    def record_progress(self, task_id: int, downloaded: int) -> None:
+        """Record fresh progress for an in-flight download (resets its timer)."""
+        self._watchdog.record_progress(task_id, downloaded)
+
+    def finish_download(self, task_id: int) -> None:
+        """Mark a download as no longer in-flight."""
+        self._watchdog.finish_download(task_id)
 
     def start(self) -> None:
         """Start the live display."""
@@ -86,6 +113,9 @@ class LiveManager:
 
     def stop(self) -> None:
         """Stop the live display and log the execution time."""
+        # Stop the stall watchdog before tearing down the live view.
+        self._watchdog.stop()
+
         execution_time = self._compute_execution_time()
 
         # Log the execution time in hh:mm:ss format
