@@ -11,16 +11,20 @@ from .config import HOST_NETLOC, REGIONS
 
 def validate_url(album_url: str) -> str | None:
     """Validate and normalize an Erome album URL."""
-    parsed_url = urlparse(album_url)
+    parsed_url = urlparse(album_url.strip())
 
-    if parsed_url.netloc == HOST_NETLOC:
-        return album_url
+    # Strip a trailing slash from the path: erome returns a 404 for the
+    # ".../a/ID/" form, so ".../a/ID/" must be normalized to ".../a/ID".
+    normalized_path = parsed_url.path.rstrip("/")
 
-    for region in REGIONS:
-        if parsed_url.netloc == f"{region}.erome.com":
-            return f"https://{HOST_NETLOC}{parsed_url.path}"
+    # Accept the main host and any regional host, always rewriting to the
+    # canonical https://www.erome.com/<path> form.
+    if parsed_url.netloc == HOST_NETLOC or parsed_url.netloc in {
+        f"{region}.erome.com" for region in REGIONS
+    }:
+        return f"https://{HOST_NETLOC}{normalized_path}"
 
-    logging.error("Provide a valid Erome URL.")
+    logging.error("Provide a valid Erome URL: %s", album_url)
     return None
 
 

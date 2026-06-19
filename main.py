@@ -31,16 +31,36 @@ def process_urls(urls: list[str], profile_name: str, args: Namespace) -> None:
     """Validate and processes a list of URLs to download items."""
     live_manager = initialize_managers()
 
+    total = len(urls)
     try:
         with live_manager.live:
-            for url in urls:
+            for index, url in enumerate(urls, start=1):
                 validated_url = validate_url(url)
-                download_album(
-                    validated_url,
-                    live_manager,
-                    profile=profile_name,
-                    custom_path=args.custom_path,
+                if validated_url is None:
+                    live_manager.update_log(
+                        "Skipped", f"({index}/{total}) Invalid URL: {url}",
+                    )
+                    continue
+
+                live_manager.update_log(
+                    "Processing", f"({index}/{total}) {validated_url}",
                 )
+
+                # Isolate each album so a single failure (network error,
+                # rate-limit, unexpected page markup) skips that URL instead of
+                # aborting the remaining downloads.
+                try:
+                    download_album(
+                        validated_url,
+                        live_manager,
+                        profile=profile_name,
+                        custom_path=args.custom_path,
+                    )
+                except Exception as album_err:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+                    live_manager.update_log(
+                        "Error",
+                        f"({index}/{total}) Failed: {validated_url} - {album_err}",
+                    )
 
             live_manager.stop()
 
