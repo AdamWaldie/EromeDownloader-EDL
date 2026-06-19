@@ -11,6 +11,7 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import sys
 from typing import TYPE_CHECKING
 
@@ -58,6 +59,15 @@ def handle_profile_processing(profile_url: str) -> str | None:
 
 def main() -> None:
     """Run the script."""
+    # Configure logging so fetch/network warnings and errors are visible.
+    # Without this, the module-level logging calls in the project are silenced
+    # below WARNING and the script can fail without any explanation.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     # Clear the terminal and profile dump file
     clear_terminal()
     write_file(DUMP_FILE)
