@@ -10,7 +10,7 @@ from __future__ import annotations
 import datetime
 import time
 
-from rich.console import Group
+from rich.console import Console, Group
 from rich.live import Live
 
 from .log_manager import LoggerTable
@@ -34,8 +34,17 @@ class LiveManager:
         self.progress_manager = progress_manager
         self.progress_table = self.progress_manager.create_progress_table()
         self.logger_table = logger_table
+        self.console = Console()
+        # Rich's Live dashboard only renders when stdout is a real terminal.
+        # When running from an IDE run window, a redirected/piped stream, or a
+        # notebook, there is no TTY, so the dashboard would render nothing and
+        # the script appears to do nothing. Detect that case and fall back to
+        # plain printed log lines so there is always visible console output.
+        self.plain_output = not self.console.is_terminal
         self.live = Live(
-            self._render_live_view(), refresh_per_second=refresh_per_second,
+            self._render_live_view(),
+            console=self.console,
+            refresh_per_second=refresh_per_second,
         )
         self.start_time = time.time()
         self.update_log("Script started", "The script has started execution.")
@@ -62,6 +71,13 @@ class LiveManager:
     def update_log(self, event: str, details: str) -> None:
         """Log an event and refreshes the live display."""
         self.logger_table.log(event, details)
+        if self.plain_output:
+            # No TTY: the live table is invisible, so print the event directly
+            # to give the user feedback on what the script is doing.
+            timestamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+                "%H:%M:%S",
+            )
+            print(f"[{timestamp}] {event}: {details}", flush=True)
         self.live.update(self._render_live_view())
 
     def start(self) -> None:
