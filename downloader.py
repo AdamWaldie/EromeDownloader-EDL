@@ -12,7 +12,14 @@ from urllib.parse import urlparse
 
 import requests
 
-from src.config import HOST_PAGE, USER_AGENT, READ_TIMEOUT, CONNECT_TIMEOUT
+from src.config import (
+    CONNECT_TIMEOUT,
+    HOST_NETLOC,
+    HOST_PAGE,
+    READ_TIMEOUT,
+    REGIONS,
+    USER_AGENT,
+)
 from src.download_utils import run_in_parallel_ordered, save_file_with_progress
 from src.erome_utils import extract_hostname
 from src.file_utils import create_download_directory
@@ -23,6 +30,52 @@ if TYPE_CHECKING:
     from requests.models import Response
 
     from src.managers.live_manager import LiveManager
+
+# Media file extensions used to classify links and to recover a usable file
+# extension when a URL omits one.
+IMAGE_EXTENSIONS = frozenset(
+    {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp"}
+)
+VIDEO_EXTENSIONS = frozenset({".mp4", ".webm", ".mov", ".m4v", ".mkv"})
+
+
+def normalize_media_url(url: str | None) -> str | None:
+    """Return an absolute http(s) media URL, or None for placeholders.
+
+    Handles protocol-relative URLs (``//host/path``) and skips ``data:`` URIs
+    and other non-http placeholders used by lazy-loading.
+    """
+    if not url:
+        return None
+
+    url = url.strip()
+    if url.startswith("//"):
+        return f"https:{url}"
+    if url.startswith(("http://", "https://")):
+        return url
+    return None
+
+
+def media_extension(url: str) -> str:
+    """Return the lowercase file extension of a media URL (e.g. '.jpg')."""
+    return Path(urlparse(url).path).suffix.lower()
+
+
+def is_image_url(url: str) -> bool:
+    """Return True if the URL points to a known image type."""
+    return media_extension(url) in IMAGE_EXTENSIONS
+
+
+# Erome serves media from CDN subdomains (e.g. s11.erome.com); the main site
+# hosts serve avatars/logos that must not be mistaken for album media.
+SITE_HOSTS = frozenset(
+    {HOST_NETLOC, *(f"{region}.erome.com" for region in REGIONS)}
+)
+
+
+def is_site_host(url: str) -> bool:
+    """Return True if the URL is on a main site host (not a media CDN host)."""
+    return urlparse(url).netloc in SITE_HOSTS
 
 
 def get_cookies_header() -> dict[str, str]:
@@ -181,23 +234,40 @@ def extract_download_links(soup: BeautifulSoup) -> list[str]:
     """
     download_links = []
     seen = set()  # Track URLs we've already added to avoid duplicates
-    
-    # Process images first (they typically appear before videos in the HTML)
-    image_items = soup.find_all("img", {"class": "img-back"})
-    for image_item in image_items:
-        url = image_item.get("data-src")
+
+    def add_link(raw_url: str | None) -> None:
+        url = normalize_media_url(raw_url)
         if url and url not in seen:
             download_links.append(url)
             seen.add(url)
-    
-    # Then process videos
-    video_items = soup.find_all("source")
-    for video_item in video_items:
-        url = video_item.get("src")
-        if url and url not in seen:
-            download_links.append(url)
-            seen.add(url)
-    
+
+    # Process images first (they typically appear before videos in the HTML).
+    # Primary selector: erome's full-resolution image is the `data-src` of an
+    # <img class="img-back">. Fall back to `src` for non-lazy-loaded variants.
+    image_urls = []
+    for image_item in soup.find_all("img", {"class": "img-back"}):
+        url = normalize_media_url(image_item.get("data-src") or image_item.get("src"))
+        if url:
+            image_urls.append(url)
+
+    # Fallback: if the primary selector matched nothing (e.g. erome changed the
+    # image markup/class), scan every <img> and keep any real image URL. This
+    # is what prevents albums from silently downloading videos only.
+    if not image_urls:
+        for image_item in soup.find_all("img"):
+            url = normalize_media_url(
+                image_item.get("data-src") or image_item.get("src")
+            )
+            if url and is_image_url(url) and not is_site_host(url):
+                image_urls.append(url)
+
+    for url in image_urls:
+        add_link(url)
+
+    # Then process videos (each <video> exposes its file via a <source>).
+    for video_item in soup.find_all("source"):
+        add_link(video_item.get("src") or video_item.get("data-src"))
+
     return download_links
 
 
@@ -272,7 +342,12 @@ def download_item(
     parsed_url = urlparse(download_link)
     original_filename = Path(parsed_url.path).name
     file_extension = Path(original_filename).suffix  # e.g., '.mp4', '.jpg'
-    
+
+    # Recover a usable extension when the URL omits one, so saved files remain
+    # openable (otherwise an extension-less image is hard to view).
+    if not file_extension:
+        file_extension = ".jpg" if is_image_url(download_link) else ".mp4"
+
     # Generate sequential filename
     filename = generate_sequential_filename(
         album_name, file_number, total_files, file_extension
@@ -310,6 +385,15 @@ def download_album(
 
     # Get download links in order
     download_links = extract_download_links(soup)
+
+    # Surface what was detected so a "videos only" album is obvious at a glance.
+    num_images = sum(1 for link in download_links if is_image_url(link))
+    num_videos = len(download_links) - num_images
+    live_manager.update_log(
+        "Media found",
+        f"{album_id}: {num_images} images, {num_videos} videos",
+    )
+
     if download_links is None or len(download_links) == 0:
         return
 
