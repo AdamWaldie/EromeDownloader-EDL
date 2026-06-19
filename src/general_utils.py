@@ -16,7 +16,7 @@ import time
 import requests
 from bs4 import BeautifulSoup
 
-from .config import HTTPStatus
+from .config import USER_AGENT, HTTPStatus
 
 
 def fetch_page(
@@ -29,9 +29,22 @@ def fetch_page(
     # Create a new session per worker
     session = requests.Session()
 
+    # Erome rejects the default "python-requests" User-Agent with a 403, so
+    # present browser-like headers for the page request.
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+
     for attempt in range(retries):
         try:
-            response = session.get(url, cookies=cookies, timeout=timeout)
+            response = session.get(
+                url, cookies=cookies, headers=headers, timeout=timeout,
+            )
             if response.status_code in (HTTPStatus.NOT_FOUND, HTTPStatus.GONE):
                 log_message = f"Page not found or permanently removed: {url}"
                 logging.warning(log_message)
