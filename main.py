@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from typing import TYPE_CHECKING
 
 from downloader import download_album
-from src.config import DUMP_FILE, URLS_FILE, parse_arguments
+from src.config import DUMP_FILE, INTER_ALBUM_DELAY, URLS_FILE, parse_arguments
 from src.erome_utils import extract_profile_name, validate_url
 from src.file_utils import read_file, write_file
 from src.general_utils import clear_terminal
@@ -61,6 +62,11 @@ def process_urls(urls: list[str], profile_name: str, args: Namespace) -> None:
                         "Error",
                         f"({index}/{total}) Failed: {validated_url} - {album_err}",
                     )
+
+                # Brief politeness delay between albums to reduce the chance of
+                # tripping erome's rate limiting on a long list of URLs.
+                if index < total and INTER_ALBUM_DELAY > 0:
+                    time.sleep(INTER_ALBUM_DELAY)
 
             live_manager.stop()
 

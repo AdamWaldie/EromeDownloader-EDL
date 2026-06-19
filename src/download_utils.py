@@ -1,6 +1,6 @@
 """Utilities for handling file downloads with progress tracking."""
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from requests import Response
@@ -27,31 +27,60 @@ def save_file_with_progress(
     download_path: str,
     task: int,
     live_manager: LiveManager,
-) -> None:
+    name: str | None = None,
+) -> int:
     """Save the content of a response to a file while tracking download progress.
-    
-    OPTIMIZED: Uses improved chunk sizing for better throughput.
+
+    Registers the download with the live manager's stall watchdog so a frozen
+    transfer can be identified, and returns the number of bytes written.
     """
     file_size = int(response.headers.get("content-length", -1))
     chunk_size = get_chunk_size(file_size)
     total_downloaded = 0
+    label = name if name is not None else Path(download_path).name
 
-    with Path(download_path).open("wb") as file:
-        for chunk in response.iter_content(chunk_size=chunk_size):
-            if chunk:
-                file.write(chunk)
-                total_downloaded += len(chunk)
-                progress_percentage = (total_downloaded / file_size) * 100
-                live_manager.update_task(task, completed=progress_percentage)
+    live_manager.start_download(task, label, file_size)
+    try:
+        with Path(download_path).open("wb") as file:
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    file.write(chunk)
+                    total_downloaded += len(chunk)
+                    # content-length may be missing (-1); only show a percentage
+                    # when the total size is known to avoid bogus values.
+                    if file_size > 0:
+                        progress_percentage = (total_downloaded / file_size) * 100
+                        live_manager.update_task(task, completed=progress_percentage)
+                    live_manager.record_progress(task, total_downloaded)
+    finally:
+        live_manager.finish_download(task)
+
+    return total_downloaded
 
 
-def manage_running_tasks(futures: dict, live_manager: LiveManager) -> None:
-    """Manage the status of running tasks and update their progress."""
-    while futures:
-        for future in list(futures.keys()):
-            if future.running():
-                task_id = futures.pop(future)
-                live_manager.update_task(task_id, visible=True)
+def _collect_results(
+    futures: dict,
+    live_manager: LiveManager,
+    num_items: int,
+) -> None:
+    """Wait for every submitted download and surface any per-file failure.
+
+    Reading ``future.result()`` is what makes a download error visible: the
+    ThreadPoolExecutor stores exceptions on the future, so without this the
+    failure is swallowed silently. A failed file is logged and its task is
+    forced to a finished state so the overall progress advances past it and the
+    album can complete instead of stalling.
+    """
+    for future in as_completed(futures):
+        task_id, file_number, item = futures[future]
+        try:
+            future.result()
+        except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            live_manager.update_log(
+                "Download failed",
+                f"File {file_number}/{num_items}: {item} - {exc}",
+            )
+            live_manager.update_task(task_id, completed=100, visible=False)
 
 
 def run_in_parallel(
@@ -61,10 +90,7 @@ def run_in_parallel(
     identifier: str,
     *args: tuple,
 ) -> None:
-    """Execute a function in parallel for a list of items, using multiple workers.
-    
-    OPTIMIZED: Now uses increased MAX_WORKERS from config for better parallelization.
-    """
+    """Execute a function in parallel for a list of items, using multiple workers."""
     num_items = len(items)
     futures = {}
 
@@ -73,9 +99,11 @@ def run_in_parallel(
 
         for current_task, item in enumerate(items):
             task_id = live_manager.add_task(current_task=current_task)
+            file_number = current_task + 1
             future = executor.submit(func, item, task_id, live_manager, *args)
-            futures[future] = task_id
-            manage_running_tasks(futures, live_manager)
+            futures[future] = (task_id, file_number, item)
+
+        _collect_results(futures, live_manager, num_items)
 
 
 def run_in_parallel_ordered(
@@ -86,10 +114,10 @@ def run_in_parallel_ordered(
     *args: tuple,
 ) -> None:
     """Execute a function in parallel while maintaining sequential file numbering.
-    
+
     This function passes the file number and total count to the download function
     so files can be named sequentially (e.g., "Album (001).mp4", "Album (002).jpg")
-    
+
     Args:
         func: Function to execute (should accept file_number and total_files params)
         items: List of items to process (download links)
@@ -106,10 +134,11 @@ def run_in_parallel_ordered(
         for current_task, item in enumerate(items):
             task_id = live_manager.add_task(current_task=current_task)
             file_number = current_task + 1  # 1-indexed file numbering
-            
+
             # Pass file_number and total_files to the download function
             future = executor.submit(
-                func, item, task_id, live_manager, *args, file_number, num_items
+                func, item, task_id, live_manager, *args, file_number, num_items,
             )
-            futures[future] = task_id
-            manage_running_tasks(futures, live_manager)
+            futures[future] = (task_id, file_number, item)
+
+        _collect_results(futures, live_manager, num_items)

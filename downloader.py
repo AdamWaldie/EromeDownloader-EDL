@@ -6,6 +6,7 @@ downloads them to a specified local directory.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
@@ -16,6 +17,7 @@ from src.config import (
     CONNECT_TIMEOUT,
     HOST_NETLOC,
     HOST_PAGE,
+    MAX_RETRIES,
     READ_TIMEOUT,
     REGIONS,
     USER_AGENT,
@@ -23,7 +25,7 @@ from src.config import (
 from src.download_utils import run_in_parallel_ordered, save_file_with_progress
 from src.erome_utils import extract_hostname
 from src.file_utils import create_download_directory
-from src.general_utils import fetch_page
+from src.general_utils import fetch_page, is_rate_limited, rate_limit_delay
 
 if TYPE_CHECKING:
     from bs4 import BeautifulSoup
@@ -91,8 +93,15 @@ def is_erome_media_url(url: str) -> bool:
 
 
 def get_cookies_header() -> dict[str, str]:
-    """Build a cookies header dict from a request object."""
-    response = requests.get(HOST_PAGE, timeout=10)
+    """Build a cookies header dict from a request object.
+
+    The browser User-Agent is sent so erome returns a valid session instead of
+    a 403, which would otherwise add a failed request per album and push us
+    toward rate limiting sooner.
+    """
+    response = requests.get(
+        HOST_PAGE, headers={"User-Agent": USER_AGENT}, timeout=10,
+    )
     laravel_session = response.cookies.get("laravel_session")
     xsrf_token = response.cookies.get("XSRF-TOKEN")
     cookies_value = f'XSRF-TOKEN="{xsrf_token}"; laravel_session="{laravel_session}"'
@@ -358,38 +367,91 @@ def download_item(
     file_number: int,
     total_files: int,
 ) -> None:
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     """Download a file from the specified download link with sequential naming.
-    
-    Args:
-        download_link: URL of the file to download
-        task_id: Task ID for progress tracking
-        live_manager: Live manager for progress updates
-        download_path: Directory to save the file
-        album_url: URL of the album (for headers)
-        album_name: Name of the album (for filename)
-        file_number: Position of this file (1-indexed)
-        total_files: Total number of files in album
+
+    The call convention (download_path, album_url, album_name, file_number,
+    total_files) is fixed by ``run_in_parallel_ordered``, hence the argument
+    count. Logs the start and completion (with size and duration) of each file.
     """
     # Extract the file extension from the original URL
-    parsed_url = urlparse(download_link)
-    original_filename = Path(parsed_url.path).name
-    file_extension = Path(original_filename).suffix  # e.g., '.mp4', '.jpg'
+    file_extension = Path(urlparse(download_link).path).suffix  # e.g. '.mp4'
 
     # Recover a usable extension when the URL omits one, so saved files remain
     # openable (otherwise an extension-less image is hard to view).
     if not file_extension:
         file_extension = ".jpg" if is_image_url(download_link) else ".mp4"
 
-    # Generate sequential filename
     filename = generate_sequential_filename(
-        album_name, file_number, total_files, file_extension
+        album_name, file_number, total_files, file_extension,
     )
-    
-    hostname = extract_hostname(download_link)
     final_path = Path(download_path) / filename
+    label = f"File {file_number}/{total_files}: {filename}"
 
-    with configure_session(download_link, hostname, album_url) as response:
-        save_file_with_progress(response, final_path, task_id, live_manager)
+    live_manager.update_log("Downloading", f"{label} <- {download_link}")
+    start_time = time.time()
+    written = _download_to_path(
+        download_link, album_url, final_path, task_id, live_manager, label,
+    )
+    elapsed = time.time() - start_time
+    live_manager.update_log(
+        "Downloaded",
+        f"{label} ({format_size(written)} in {elapsed:.1f}s)",
+    )
+
+
+def format_size(num_bytes: int) -> str:
+    """Render a byte count as a human-readable string (e.g. '4.2 MB')."""
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def _download_to_path(
+    download_link: str,
+    album_url: str,
+    final_path: Path,
+    task_id: int,
+    live_manager: LiveManager,
+    label: str,
+) -> int:
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
+    """Fetch a single media file, retrying when the host rate limits us.
+
+    Returns the number of bytes written. Raises the underlying error if the
+    download still fails after exhausting retries, so the caller can log it.
+    """
+    hostname = extract_hostname(download_link)
+    for attempt in range(MAX_RETRIES):
+        response = configure_session(download_link, hostname, album_url)
+
+        # A media host can rate limit / soft-block the CDN request just like the
+        # album page; back off and retry instead of writing an error body to a
+        # media file.
+        if is_rate_limited(response.status_code):
+            wait = rate_limit_delay(response, attempt)
+            response.close()
+            if attempt == MAX_RETRIES - 1:
+                msg = f"rate limited (HTTP {response.status_code}) after retries"
+                raise RuntimeError(msg)
+            live_manager.update_log(
+                "Rate limited",
+                f"{label}: HTTP {response.status_code}, backing off "
+                f"{wait:.0f}s (attempt {attempt + 1}/{MAX_RETRIES})",
+            )
+            time.sleep(wait)
+            continue
+
+        response.raise_for_status()
+        with response:
+            return save_file_with_progress(
+                response, final_path, task_id, live_manager, name=label,
+            )
+
+    return 0
 
 
 def download_album(
