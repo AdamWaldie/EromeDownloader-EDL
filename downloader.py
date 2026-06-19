@@ -78,6 +78,18 @@ def is_site_host(url: str) -> bool:
     return urlparse(url).netloc in SITE_HOSTS
 
 
+def is_erome_media_url(url: str) -> bool:
+    """Return True if the URL is hosted on an erome media CDN host.
+
+    Album media is served from CDN subdomains such as ``s21.erome.com``. This
+    accepts those hosts while rejecting the main site hosts (avatars/logos) and
+    any third-party host (ads, trackers, consent/privacy widgets) that must
+    never be downloaded as album media.
+    """
+    netloc = urlparse(url).netloc.lower()
+    return netloc.endswith(".erome.com") and netloc not in SITE_HOSTS
+
+
 def get_cookies_header() -> dict[str, str]:
     """Build a cookies header dict from a request object."""
     response = requests.get(HOST_PAGE, timeout=10)
@@ -229,8 +241,13 @@ def get_album_name_for_files(soup: BeautifulSoup) -> str:
 
 def extract_download_links(soup: BeautifulSoup) -> list[str]:
     """Extract download links for image and video sources from the album URL.
-    
-    IMPORTANT: Returns links in the order they appear on the page to preserve sequence.
+
+    Extraction is scoped to the album's own media containers so unrelated
+    images on the page (related-album thumbnails, avatars/logos, ads and
+    third-party consent/privacy widgets) are never downloaded.
+
+    IMPORTANT: Returns links in the order they appear on the page to preserve
+    sequence.
     """
     download_links = []
     seen = set()  # Track URLs we've already added to avoid duplicates
@@ -241,32 +258,47 @@ def extract_download_links(soup: BeautifulSoup) -> list[str]:
             download_links.append(url)
             seen.add(url)
 
-    # Process images first (they typically appear before videos in the HTML).
-    # Primary selector: erome's full-resolution image is the `data-src` of an
-    # <img class="img-back">. Fall back to `src` for non-lazy-loaded variants.
-    image_urls = []
+    def add_media_from(container) -> None:
+        # Image: full-resolution source is the `data-src` of <img class="img-back">.
+        # Fall back to `src` for non-lazy-loaded variants.
+        for image_item in container.find_all("img", {"class": "img-back"}):
+            add_link(image_item.get("data-src") or image_item.get("src"))
+        # Video: each <video> exposes its file via a <source>.
+        for video_item in container.find_all("source"):
+            add_link(video_item.get("src") or video_item.get("data-src"))
+
+    # Erome wraps each album item (image or video) in a <div class="media-group">.
+    # Scoping to these containers keeps only the album's own media and preserves
+    # the true on-page order (images and videos interleaved as uploaded).
+    media_groups = soup.find_all("div", {"class": "media-group"})
+    if media_groups:
+        for group in media_groups:
+            add_media_from(group)
+        return download_links
+
+    # Fallback: erome changed its markup and no media-group containers were
+    # found. Scan the document but accept only media served from erome's CDN
+    # hosts, so third-party images (ads/trackers/consent widgets) are excluded.
     for image_item in soup.find_all("img", {"class": "img-back"}):
         url = normalize_media_url(image_item.get("data-src") or image_item.get("src"))
-        if url:
-            image_urls.append(url)
+        if url and is_erome_media_url(url):
+            add_link(url)
 
-    # Fallback: if the primary selector matched nothing (e.g. erome changed the
-    # image markup/class), scan every <img> and keep any real image URL. This
-    # is what prevents albums from silently downloading videos only.
-    if not image_urls:
+    # If the class-based selector still found no images, scan every <img> and
+    # keep real image URLs that live on an erome CDN host. This prevents albums
+    # from silently downloading videos only without re-introducing junk images.
+    if not any(is_image_url(link) for link in download_links):
         for image_item in soup.find_all("img"):
             url = normalize_media_url(
                 image_item.get("data-src") or image_item.get("src")
             )
-            if url and is_image_url(url) and not is_site_host(url):
-                image_urls.append(url)
+            if url and is_image_url(url) and is_erome_media_url(url):
+                add_link(url)
 
-    for url in image_urls:
-        add_link(url)
-
-    # Then process videos (each <video> exposes its file via a <source>).
     for video_item in soup.find_all("source"):
-        add_link(video_item.get("src") or video_item.get("data-src"))
+        url = normalize_media_url(video_item.get("src") or video_item.get("data-src"))
+        if url and is_erome_media_url(url):
+            add_link(url)
 
     return download_links
 
